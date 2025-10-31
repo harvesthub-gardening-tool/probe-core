@@ -1,8 +1,8 @@
 # harvesthub-stm32
 
 Deux modes:
-- **Simulation PC**: `cargo run`
-- **Firmware STM32F103C8**: `rustup target add thumbv7m-none-eabi && cargo build --release --target thumbv7m-none-eabi --features firmware`
+- **Simulation PC**: `cargo computer`
+- **Firmware STM32F103C8**: `cargo firmware`
 
 Flash (quand carte disponible):
 ```
