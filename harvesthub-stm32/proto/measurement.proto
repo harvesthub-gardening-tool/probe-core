@@ -1,8 +1,0 @@
-syntax = "proto3";
-
-package measurement;
-
-message Measure {
-  float temperature_c = 1;
-  float humidity_rh   = 2;
-}
