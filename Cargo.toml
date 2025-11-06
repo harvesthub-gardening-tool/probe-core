@@ -1,27 +1,25 @@
 [package]
-name = "harvesthub-stm32"
+name = "probe-core"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
 [dependencies]
-# Protobuf runtime (no_std possible)
-prost = { version = "0.14", default-features = false, features = ["derive"] }
-# Pour firmware (no_std + alloc)
 embedded-alloc  = { version = "0.6", optional = true, features = ["llff"] }
 cortex-m-rt     = { version = "0.7", optional = true }
 cortex-m        = { version = "0.7", optional = true, features = ["critical-section-single-core"] }
 panic-halt      = { version = "1.0", optional = true }
 critical-section = "1.1"
 
-[build-dependencies]
-prost-build = "0.14"
-protoc-bin-vendored = "3"
+# --- serialization ---
+serde   = { version = "1", default-features = false, features = ["derive"] }
+bincode = { version = "2", features = ["serde"], optional = true } # Computer
+postcard = { version = "1.1", features = ["alloc"], optional = true } # Firmware
 
 [features]
-computer = []
-firmware = ["embedded-alloc", "cortex-m-rt", "panic-halt", "cortex-m"]
+computer = ["bincode"]
+firmware = ["embedded-alloc", "cortex-m-rt", "panic-halt", "cortex-m", "postcard"]
 
 [profile.release]
 lto = true
 codegen-units = 1
+panic = "abort"
