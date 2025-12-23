@@ -15,7 +15,9 @@ mod host_codec {
     use super::Measure;
     use bincode::config::standard;
     use bincode::serde::{decode_from_slice, encode_to_vec};
-    pub fn to_bytes(m: &Measure) -> Vec<u8> { encode_to_vec(m, standard()).expect("encode") }
+    pub fn to_bytes(m: &Measure) -> Vec<u8> {
+        encode_to_vec(m, standard()).expect("encode")
+    }
     pub fn from_bytes(b: &[u8]) -> Option<Measure> {
         decode_from_slice(b, standard()).ok().map(|(v, _)| v)
     }
@@ -28,7 +30,9 @@ mod fw_codec {
     pub fn to_bytes(m: &Measure) -> alloc::vec::Vec<u8> {
         postcard::to_allocvec(m).expect("encode")
     }
-    pub fn from_bytes(b: &[u8]) -> Option<Measure> { postcard::from_bytes(b).ok() }
+    pub fn from_bytes(b: &[u8]) -> Option<Measure> {
+        postcard::from_bytes(b).ok()
+    }
 }
 
 #[cfg(feature = "computer")]

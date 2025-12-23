@@ -1,8 +1,8 @@
 use std::{thread, time::Duration};
 
-use probe_core::Measure;
-use probe_core::to_bytes;
 use probe_core::from_bytes;
+use probe_core::to_bytes;
+use probe_core::Measure;
 
 /// Host-side simulation (std)
 pub fn run() {
@@ -28,7 +28,10 @@ pub fn run() {
 
         // Decode again to verify round-trip
         if let Some(msg2) = from_bytes(&buf) {
-            println!("\nMeasure: T={:.2}°C  RH={:.2}%", msg2.temperature_c, msg2.humidity_rh);
+            println!(
+                "\nMeasure: T={:.2}°C  RH={:.2}%",
+                msg2.temperature_c, msg2.humidity_rh
+            );
         } else {
             println!("\nDecode failed!");
         }

@@ -1,6 +1,6 @@
+# Rust format pipeline
 name: "Rust format"
 on:
-  push:
   pull_request:
 
 jobs:
