@@ -3,15 +3,18 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use probe_core::Measure;
 use probe_core::to_bytes;
+use probe_core::Measure;
 
 /// Firmware loop (no_std + alloc).
 pub fn run() -> ! {
     let (mut t, mut rh) = (20.0f32, 40.0f32);
 
     loop {
-        let msg = Measure { temperature_c: t, humidity_rh: rh };
+        let msg = Measure {
+            temperature_c: t,
+            humidity_rh: rh,
+        };
 
         let buf: Vec<u8> = to_bytes(&msg);
 
