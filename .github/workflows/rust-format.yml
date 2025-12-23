@@ -1,3 +1,4 @@
+# Rust format pipeline
 name: "Rust format"
 on:
   push:
