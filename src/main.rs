@@ -196,22 +196,39 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             .unwrap();
 
         println!("[BLE] En attente d'une connexion...");
-        let connexion = advertiser.accept().await.unwrap();
+        let conn = advertiser
+            .accept()
+            .await
+            .unwrap()
+            .with_attribute_server(&server)
+            .unwrap();
         println!("[BLE] Connexion etablie !");
 
-        // ----- Mise à jour avec de nouvelles valeurs "au pif" -----
-        // Pour simuler une évolution des données à chaque nouvelle connexion
-        let temp_pif = 2450; // 24.50 °C
-        let hum_pif = 6200;  // 62.00 %
+        // Mettre à jour les valeurs avant que le HUB lise
+        let temp_pif: i16 = 2450; // 24.50 °C
+        let hum_pif: u16 = 6200;  // 62.00 %
         server.environnement.temperature.set(&server, &temp_pif).unwrap();
         server.environnement.humidite.set(&server, &hum_pif).unwrap();
-        // ----------------------------------------------------------
 
-        // Laisser le HUB lire les données (10s)
-        Timer::after(Duration::from_secs(10)).await;
+        // Traiter les événements GATT jusqu'à déconnexion
+        // Sans cette boucle, le HUB envoie un Read Request et ne reçoit jamais de réponse
+        loop {
+            match conn.next().await {
+                trouble_host::gatt::GattConnectionEvent::Disconnected { reason } => {
+                    println!("[BLE] Deconnecte : {:?}", reason);
+                    break;
+                }
+                trouble_host::gatt::GattConnectionEvent::Gatt { event } => {
+                    // Laisser le serveur GATT traiter la requête et envoyer la réponse
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
+                    }
+                }
+                _ => {}
+            }
+        }
 
-        drop(connexion);
-        println!("[BLE] Deconnecte. Prochain cycle dans 30s...");
+        println!("[BLE] Prochain cycle dans 30s...");
 
         Timer::after(Duration::from_secs(30)).await;
     }
