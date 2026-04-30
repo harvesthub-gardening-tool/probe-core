@@ -1,7 +1,8 @@
-[target.thumbv7m-none-eabi]
-runner = "probe-rs run --chip STM32F103C8Tx"
-rustflags = ["-C", "link-arg=-Tlink.x"]
+[build]
+target = "thumbv7em-none-eabihf"
 
-[alias]
-computer = "run --features computer"
-firmware = "build --release --no-default-features --features firmware --target thumbv7m-none-eabi"
+[target.thumbv7em-none-eabihf]
+runner = "sh -c 'arm-none-eabi-objcopy -O binary $0 $0.bin && echo \"\" && echo \"=== Built: $0.bin ===\" && ls -la $0.bin && echo \"\" && echo \"To flash with stm32flash (BOOT0=1, then reset):\" && echo \"  stm32flash -w $0.bin -v -g 0x0 -b 115200 ${SERIAL_PORT:-/dev/tty.usbserial-XXXX}\" && echo \"\"'"
+
+[env]
+DEFMT_LOG = "trace"
