@@ -628,7 +628,7 @@ impl SensorSnapshot {
                 let humidity_centi = if reading.is_bmp280 {
                     0
                 } else {
-                    let centi = (u64::from(reading.humidity_q1024) * 10_000 + 512) / 1024;
+                    let centi = (u64::from(reading.humidity_q1024) * 100 + 512) / 1024;
                     centi.min(u16::MAX as u64) as u16
                 };
 
