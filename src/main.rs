@@ -7,6 +7,7 @@ use core::time::Duration as CoreDuration;
 
 use cortex_m::interrupt::Mutex;
 use embassy_executor::Spawner;
+use embassy_stm32::flash::{Blocking, Error as FlashError, Flash};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::ipcc::{
@@ -37,7 +38,7 @@ use embassy_stm32_wpan::hci::vendor::command::gatt::{
 };
 use embassy_stm32_wpan::hci::vendor::command::hal::{ConfigData, HalCommands, PowerLevel};
 use embassy_stm32_wpan::hci::vendor::event::command::VendorReturnParameters;
-use embassy_stm32_wpan::hci::vendor::event::AttributeHandle;
+use embassy_stm32_wpan::hci::vendor::event::{AttributeHandle, VendorEvent};
 use embassy_stm32_wpan::hci::BdAddr;
 use embassy_stm32_wpan::hci::Event;
 use embassy_stm32_wpan::hci::Status;
@@ -74,12 +75,18 @@ type SharedTx = Mutex<RefCell<Option<UartTx<'static, embassy_stm32::mode::Async>
 static TX_CELL: StaticCell<SharedTx> = StaticCell::new();
 
 const DEVICE_NAME: &[u8] = b"HH-PROBE-A";
+const SETUP_DEVICE_NAME: &[u8] = b"HH-PROBE-SETUP";
 const PROBE_UUID: &str = env!("PROBE_BUILD_UUID");
-const BLE_GAP_DEVICE_NAME_LENGTH: u8 = DEVICE_NAME.len() as u8;
+const BLE_GAP_DEVICE_NAME_LENGTH: u8 = if SETUP_DEVICE_NAME.len() > DEVICE_NAME.len() {
+    SETUP_DEVICE_NAME.len() as u8
+} else {
+    DEVICE_NAME.len() as u8
+};
 const PROBE_VERSION_MAJOR: u8 = 1;
 const PROBE_VERSION_MINOR: u8 = 0;
 const HUB_COMPANY_ID_LE: [u8; 2] = 0x1234_u16.to_le_bytes();
-const PROBE_ADV_DATA: [u8; 24] = [
+const PROBE_ADV_DATA: [u8; 14] = [
+    13,
     0xff,
     HUB_COMPANY_ID_LE[0],
     HUB_COMPANY_ID_LE[1],
@@ -93,20 +100,28 @@ const PROBE_ADV_DATA: [u8; 24] = [
     b'E',
     PROBE_VERSION_MAJOR,
     PROBE_VERSION_MINOR,
-    DEVICE_NAME.len() as u8,
-    b'H',
-    b'H',
-    b'-',
-    b'P',
-    b'R',
-    b'O',
-    b'B',
-    b'E',
-    b'-',
-    b'A',
 ];
 const PROBE_SCAN_RESPONSE_DATA: [u8; 12] = [
     11, 0x09, b'H', b'H', b'-', b'P', b'R', b'O', b'B', b'E', b'-', b'A',
+];
+const SETUP_PROBE_ADV_DATA: [u8; 14] = [
+    13,
+    0xff,
+    HUB_COMPANY_ID_LE[0],
+    HUB_COMPANY_ID_LE[1],
+    b'H',
+    b'H',
+    b'-',
+    b'S',
+    b'E',
+    b'T',
+    b'U',
+    b'P',
+    PROBE_VERSION_MAJOR,
+    PROBE_VERSION_MINOR,
+];
+const SETUP_PROBE_SCAN_RESPONSE_DATA: [u8; 16] = [
+    15, 0x09, b'H', b'H', b'-', b'P', b'R', b'O', b'B', b'E', b'-', b'S', b'E', b'T', b'U', b'P',
 ];
 const ENVIRONMENTAL_SENSING_SERVICE_UUID: u16 = 0x181a;
 const TEMPERATURE_CHAR_UUID: u16 = 0x2a6e;
@@ -122,6 +137,9 @@ const SOIL_TEMPERATURE_CHAR_UUID: [u8; 16] = [
 ];
 const SOIL_HUMIDITY_CHAR_UUID: [u8; 16] = [
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x04, 0x00, 0x34, 0x12,
+];
+const SETUP_CONFIRM_CHAR_UUID: [u8; 16] = [
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x05, 0x00, 0x34, 0x12,
 ];
 
 const BLE_CFG_IRK: [u8; 16] = [
@@ -140,6 +158,10 @@ const RS485_POWER_SETTLE_MS: u64 = 500;
 const BLE_ADV_TIMEOUT_MS: u64 = 60_000;
 const BLE_CONNECTED_TIMEOUT_MS: u64 = 60_000;
 const BLE_TERMINATE_WAIT_MS: u64 = 10_000;
+const BLE_COMMAND_TIMEOUT_MS: u64 = 5_000;
+const SETUP_FLAG_PAGE_OFFSET: u32 = 188 * 1024;
+const SETUP_FLAG_PAGE_SIZE: u32 = 4 * 1024;
+const SETUP_COMPLETE_MAGIC: &[u8; 8] = b"HHSETUP1";
 const BME280_ADDR_PRIMARY: u8 = 0x76;
 const BME280_ADDR_SECONDARY: u8 = 0x77;
 const ZTS3000_READ_HUM_TEMP: [u8; 8] = [0x01, 0x03, 0x00, 0x00, 0x00, 0x02, 0xc4, 0x0b];
@@ -167,6 +189,7 @@ async fn main(spawner: Spawner) {
     config.rcc.mux.i2c1sel = I2c1sel::Pclk1;
     config.rcc.mux.lpuart1sel = Lpuart1sel::Pclk1;
     let p = embassy_stm32::init(config);
+    let mut flash = Flash::new_blocking(p.FLASH);
 
     let mut uart_cfg = UartConfig::default();
     uart_cfg.baudrate = 115_200;
@@ -286,7 +309,20 @@ async fn main(spawner: Spawner) {
         address_type: OwnAddressType::Public,
         filter_policy: AdvertisingFilterPolicy::AllowConnectionAndScan,
         local_name: None,
-        advertising_data: &PROBE_ADV_DATA,
+        advertising_data: &[],
+        conn_interval: (None, None),
+    };
+
+    let setup_discovery_params = DiscoverableParameters {
+        advertising_type: AdvertisingType::ConnectableUndirected,
+        advertising_interval: Some((
+            CoreDuration::from_millis(250),
+            CoreDuration::from_millis(250),
+        )),
+        address_type: OwnAddressType::Public,
+        filter_policy: AdvertisingFilterPolicy::AllowConnectionAndScan,
+        local_name: None,
+        advertising_data: &[],
         conn_interval: (None, None),
     };
 
@@ -294,7 +330,7 @@ async fn main(spawner: Spawner) {
     ble.add_service(&AddServiceParameters {
         uuid: Uuid::Uuid16(ENVIRONMENTAL_SENSING_SERVICE_UUID),
         service_type: ServiceType::Primary,
-        max_attribute_records: 14,
+        max_attribute_records: 20,
     })
     .await;
     let env_service_handle = match wait_for_gatt_add_service_complete(&mut ble).await {
@@ -446,6 +482,30 @@ async fn main(spawner: Spawner) {
         }
     };
 
+    log!("[ble ] add setup confirmation characteristic (custom 128-bit)");
+    ble.add_characteristic(&AddCharacteristicParameters {
+        service_handle: env_service_handle,
+        characteristic_uuid: Uuid::Uuid128(SETUP_CONFIRM_CHAR_UUID),
+        characteristic_properties: CharacteristicProperty::WRITE,
+        characteristic_value_len: SETUP_COMPLETE_MAGIC.len() as u16,
+        security_permissions: CharacteristicPermission::empty(),
+        gatt_event_mask: CharacteristicEvent::CONFIRM_WRITE,
+        encryption_key_size: EncryptionKeySize::with_value(7).unwrap(),
+        is_variable: false,
+    })
+    .await;
+    let setup_confirm_char_handle = match wait_for_gatt_add_characteristic_complete(&mut ble).await
+    {
+        Some(handle) => {
+            log!("[ble ] setup_confirm char handle: {:?}", handle);
+            handle
+        }
+        None => {
+            log!("[ble ] failed to add setup confirmation characteristic");
+            return;
+        }
+    };
+
     let gatt_handles = GattHandles {
         probe_uuid: probe_uuid_char_handle,
         air_temp: air_temp_char_handle,
@@ -453,6 +513,7 @@ async fn main(spawner: Spawner) {
         air_humidity: air_hum_char_handle,
         soil_temp: soil_temp_char_handle,
         soil_humidity: soil_hum_char_handle,
+        setup_confirm: setup_confirm_char_handle,
     };
 
     let mut i2c_resources = I2cSensorPeripherals {
@@ -496,6 +557,36 @@ async fn main(spawner: Spawner) {
         return;
     }
 
+    while first_boot_setup_is_pending(&mut flash) {
+        log!("[setup] first boot pending; advertising continuously as HH-PROBE-SETUP");
+        if !run_setup_advertising_session(&mut ble, &setup_discovery_params, &gatt_handles).await {
+            log!("[setup] setup advertising failed; retrying shortly");
+            Timer::after_millis(1_000).await;
+            continue;
+        }
+
+        if mark_first_boot_setup_complete(&mut flash) {
+            break;
+        }
+
+        log!("[setup] setup flag was not persisted; staying in setup mode");
+        Timer::after_millis(1_000).await;
+    }
+
+    if !first_boot_setup_is_pending(&mut flash) {
+        log!("[ble ] restore normal scan response data");
+        match ble
+            .le_set_scan_response_data(&PROBE_SCAN_RESPONSE_DATA)
+            .await
+        {
+            Ok(()) => log!("[ble ] normal scan response command sent"),
+            Err(_) => log!("[ble ] normal scan response command failed"),
+        }
+        log!("[ble ] normal scan response {:?}", ble.read().await);
+    }
+
+    log!("[setup] first boot complete; normal lifecycle enabled");
+
     loop {
         log!(
             "[cycle] sleep/idle for {}s before measurement",
@@ -524,13 +615,245 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
+        log!("[ble ] update normal advertising data");
+        if ble.update_advertising_data(&PROBE_ADV_DATA).await.is_err() {
+            log!("[ble ] normal advertising data update command failed");
+            continue;
+        }
+        if !wait_for_gap_update_advertising_data_complete(&mut ble).await {
+            log!("[ble ] normal advertising data update indicated failure");
+            continue;
+        }
+
         run_advertising_session(&mut ble).await;
     }
 }
 
+async fn run_setup_advertising_session(
+    ble: &mut (impl UartHci + GapCommands + GattCommands),
+    discovery_params: &DiscoverableParameters<'_, '_>,
+    gatt_handles: &GattHandles,
+) -> bool {
+    log!("[ble ] set setup scan response data");
+    match ble
+        .le_set_scan_response_data(&SETUP_PROBE_SCAN_RESPONSE_DATA)
+        .await
+    {
+        Ok(()) => log!("[ble ] setup scan response command sent"),
+        Err(_) => {
+            log!("[ble ] setup scan response command failed");
+            return false;
+        }
+    }
+    log!("[ble ] setup scan response {:?}", ble.read().await);
+
+    log!("[ble ] set discoverable as HH-PROBE-SETUP");
+    if ble.set_discoverable(discovery_params).await.is_err() {
+        log!("[ble ] setup discoverable command failed");
+        return false;
+    }
+    if !wait_for_gap_set_discoverable_complete(ble).await {
+        log!("[ble ] setup discoverable command-complete indicated failure");
+        return false;
+    }
+
+    log!("[ble ] update setup advertising data");
+    if ble
+        .update_advertising_data(&SETUP_PROBE_ADV_DATA)
+        .await
+        .is_err()
+    {
+        log!("[ble ] setup advertising data update command failed");
+        return false;
+    }
+    if !wait_for_gap_update_advertising_data_complete(ble).await {
+        log!("[ble ] setup advertising data update indicated failure");
+        return false;
+    }
+
+    log!("[setup] waiting indefinitely for hub pickup");
+    let mut isr_delay_count = 0u32;
+    let mut active_conn_handle = None;
+    let mut conn_deadline = None;
+    let mut setup_confirmed = false;
+
+    loop {
+        if let (Some(conn_handle), Some(deadline)) = (active_conn_handle, conn_deadline) {
+            if Instant::now() >= deadline {
+                log!(
+                    "[ble ] force terminate stale setup connection {:?}",
+                    conn_handle
+                );
+                if ble
+                    .terminate(conn_handle, Status::RemoteTerminationByUser)
+                    .await
+                    .is_err()
+                {
+                    log!("[ble ] setup terminate command failed");
+                    return false;
+                }
+                conn_deadline = Some(Instant::now() + Duration::from_millis(BLE_TERMINATE_WAIT_MS));
+            }
+        }
+
+        match ble.read().await {
+            Ok(Packet::Event(event)) => match event {
+                Event::HardwareError(HardwareError::IsrDelay) => {
+                    isr_delay_count = isr_delay_count.wrapping_add(1);
+                    if isr_delay_count == 1 || isr_delay_count.is_multiple_of(32) {
+                        log!(
+                            "[ble ] setup ISR-delay warnings: {} (UART logging throttled)",
+                            isr_delay_count
+                        );
+                    }
+                }
+                Event::LeConnectionComplete(conn) if conn.status == Status::Success => {
+                    active_conn_handle = Some(conn.conn_handle);
+                    conn_deadline =
+                        Some(Instant::now() + Duration::from_millis(BLE_CONNECTED_TIMEOUT_MS));
+                    log!(
+                        "[setup] hub pickup connection handle={:?}; waiting for disconnect",
+                        conn.conn_handle
+                    );
+                }
+                Event::LeConnectionComplete(conn) => {
+                    log!(
+                        "[ble ] setup connection failed with status {:?}",
+                        conn.status
+                    );
+                }
+                Event::DisconnectionComplete(disconnection) => {
+                    if setup_confirmed {
+                        log!(
+                            "[setup] pickup complete: disconnected handle={:?} reason={:?}",
+                            disconnection.conn_handle,
+                            disconnection.reason
+                        );
+                        return true;
+                    }
+
+                    log!(
+                        "[setup] disconnect without hub confirmation: handle={:?} reason={:?}; staying in setup mode",
+                        disconnection.conn_handle,
+                        disconnection.reason
+                    );
+                    active_conn_handle = None;
+                    conn_deadline = None;
+                    if ble.set_discoverable(discovery_params).await.is_err() {
+                        log!("[ble ] setup rediscoverable command failed");
+                        return false;
+                    }
+                    if !wait_for_gap_set_discoverable_complete(ble).await {
+                        log!("[ble ] setup rediscoverable command-complete indicated failure");
+                        return false;
+                    }
+                    log!("[ble ] refresh setup advertising data");
+                    if ble
+                        .update_advertising_data(&SETUP_PROBE_ADV_DATA)
+                        .await
+                        .is_err()
+                    {
+                        log!("[ble ] setup advertising data refresh command failed");
+                        return false;
+                    }
+                    if !wait_for_gap_update_advertising_data_complete(ble).await {
+                        log!("[ble ] setup advertising data refresh indicated failure");
+                        return false;
+                    }
+                }
+                Event::Vendor(VendorEvent::AttWritePermitRequest(request)) => {
+                    let setup_confirm_value_handle = gatt_handles.setup_confirm_value_handle();
+                    let accepted = request.attribute_handle == setup_confirm_value_handle
+                        && request.value() == SETUP_COMPLETE_MAGIC;
+
+                    if accepted {
+                        setup_confirmed = true;
+                        log!("[setup] hub pickup confirmation received");
+                    } else {
+                        log!(
+                            "[setup] rejected write attr={:?} expected_attr={:?} value={:?}",
+                            request.attribute_handle,
+                            setup_confirm_value_handle,
+                            request.value()
+                        );
+                    }
+
+                    if ble
+                        .write_response(&embassy_stm32_wpan::hci::vendor::command::gatt::WriteResponseParameters {
+                            conn_handle: request.conn_handle,
+                            attribute_handle: request.attribute_handle,
+                            status: if accepted { Ok(()) } else { Err(Status::InvalidParameters) },
+                            value: request.value(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        log!("[ble ] setup write response command failed");
+                        return false;
+                    }
+                }
+                _ => {}
+            },
+            Err(err) => log!("[ble ] setup read error {:?}", err),
+        }
+    }
+}
+
+fn first_boot_setup_is_pending(flash: &mut Flash<'_, Blocking>) -> bool {
+    let mut stored = [0u8; SETUP_COMPLETE_MAGIC.len()];
+
+    match flash.blocking_read(SETUP_FLAG_PAGE_OFFSET, &mut stored) {
+        Ok(()) if &stored == SETUP_COMPLETE_MAGIC => false,
+        Ok(()) => true,
+        Err(err) => {
+            log!(
+                "[setup] failed to read setup flag: {:?}; assuming pending",
+                err
+            );
+            true
+        }
+    }
+}
+
+fn mark_first_boot_setup_complete(flash: &mut Flash<'_, Blocking>) -> bool {
+    let page_end = SETUP_FLAG_PAGE_OFFSET + SETUP_FLAG_PAGE_SIZE;
+
+    log!(
+        "[setup] writing first boot complete flag at flash offset 0x{:05X}",
+        SETUP_FLAG_PAGE_OFFSET
+    );
+
+    match write_setup_complete_flag(flash, page_end) {
+        Ok(()) => {
+            log!("[setup] first boot complete flag persisted");
+            true
+        }
+        Err(err) => {
+            log!(
+                "[setup] failed to persist first boot complete flag: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+fn write_setup_complete_flag(
+    flash: &mut Flash<'_, Blocking>,
+    page_end: u32,
+) -> Result<(), FlashError> {
+    flash.blocking_erase(SETUP_FLAG_PAGE_OFFSET, page_end)?;
+    flash.blocking_write(SETUP_FLAG_PAGE_OFFSET, SETUP_COMPLETE_MAGIC)
+}
+
 async fn wait_for_gatt_add_service_complete(ble: &mut impl UartHci) -> Option<AttributeHandle> {
     loop {
-        let response = ble.read().await;
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GattAddService complete");
+            return None;
+        };
         if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
             if let ReturnParameters::Vendor(VendorReturnParameters::GattAddService(gatt_service)) =
                 command_complete.return_params
@@ -553,7 +876,12 @@ async fn wait_for_gatt_add_characteristic_complete(
     ble: &mut impl UartHci,
 ) -> Option<AttributeHandle> {
     loop {
-        let response = ble.read().await;
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GattAddCharacteristic complete");
+            return None;
+        };
         if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
             if let ReturnParameters::Vendor(VendorReturnParameters::GattAddCharacteristic(
                 gatt_char,
@@ -575,7 +903,12 @@ async fn wait_for_gatt_add_characteristic_complete(
 
 async fn wait_for_gatt_update_complete(ble: &mut impl UartHci) -> bool {
     loop {
-        let response = ble.read().await;
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GattUpdateCharacteristicValue complete");
+            return false;
+        };
         if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
             if let ReturnParameters::Vendor(
                 VendorReturnParameters::GattUpdateCharacteristicValue(status),
@@ -603,6 +936,14 @@ struct GattHandles {
     air_humidity: AttributeHandle,
     soil_temp: AttributeHandle,
     soil_humidity: AttributeHandle,
+    setup_confirm: AttributeHandle,
+}
+
+impl GattHandles {
+    fn setup_confirm_value_handle(&self) -> AttributeHandle {
+        // ST returns the characteristic declaration handle; central writes target the value handle.
+        AttributeHandle(self.setup_confirm.0 + 1)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -775,7 +1116,12 @@ async fn update_ble_environmental_values(
 
 async fn wait_for_gap_set_discoverable_complete(ble: &mut impl UartHci) -> bool {
     loop {
-        let response = ble.read().await;
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GapSetDiscoverable complete");
+            return false;
+        };
         if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
             if let ReturnParameters::Vendor(VendorReturnParameters::GapSetDiscoverable(status)) =
                 command_complete.return_params
@@ -789,9 +1135,39 @@ async fn wait_for_gap_set_discoverable_complete(ble: &mut impl UartHci) -> bool 
     }
 }
 
+async fn wait_for_gap_update_advertising_data_complete(ble: &mut impl UartHci) -> bool {
+    loop {
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GapUpdateAdvertisingData complete");
+            return false;
+        };
+        if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
+            if let ReturnParameters::Vendor(VendorReturnParameters::GapUpdateAdvertisingData(
+                status,
+            )) = command_complete.return_params
+            {
+                if status != Status::Success {
+                    log!(
+                        "[ble ] GapUpdateAdvertisingData failed with status {:?}",
+                        status
+                    );
+                }
+                return status == Status::Success;
+            }
+        }
+    }
+}
+
 async fn wait_for_gap_set_nondiscoverable_complete(ble: &mut impl UartHci) -> bool {
     loop {
-        let response = ble.read().await;
+        let response =
+            with_timeout(Duration::from_millis(BLE_COMMAND_TIMEOUT_MS), ble.read()).await;
+        let Ok(response) = response else {
+            log!("[ble ] timed out waiting for GapSetNonDiscoverable complete");
+            return false;
+        };
         if let Ok(Packet::Event(Event::CommandComplete(command_complete))) = response {
             if let ReturnParameters::Vendor(VendorReturnParameters::GapSetNonDiscoverable(status)) =
                 command_complete.return_params
