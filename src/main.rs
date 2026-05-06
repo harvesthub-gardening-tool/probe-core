@@ -141,6 +141,682 @@ const SOIL_HUMIDITY_CHAR_UUID: [u8; 16] = [
 const SETUP_CONFIRM_CHAR_UUID: [u8; 16] = [
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x05, 0x00, 0x34, 0x12,
 ];
+const MOTOR_COMMAND_CHAR_UUID: [u8; 16] = [
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x06, 0x00, 0x34, 0x12,
+];
+
+// Motor command write payload layout (little-endian fixed-width fields):
+// [0..4]   magic      = MOTOR_COMMAND_PAYLOAD_MAGIC
+// [4]      version    = MOTOR_COMMAND_PAYLOAD_VERSION
+// [5]      action     = MOTOR_COMMAND_ACTION_*
+// [6..22]  command_id = 16-byte command identifier (compact UUID bytes)
+// [22..26] duration   = requested motor run duration in ms (u32 LE)
+// [26..30] expires_at = remaining TTL in ms at hub write-time (u32 LE)
+// Safety defaults for later command handlers:
+// - Probe keeps only one active command at a time.
+// - Duplicate command_id values are ignored for MOTOR_COMMAND_DUPLICATE_RETENTION_MS.
+// - Duration is clamped to MOTOR_COMMAND_MAX_DURATION_MS.
+// - Expired commands must be ignored.
+const MOTOR_COMMAND_PAYLOAD_MAGIC: &[u8; 4] = b"HHMC";
+const MOTOR_COMMAND_PAYLOAD_VERSION: u8 = 1;
+const MOTOR_COMMAND_ACTION_STOP: u8 = 0;
+const MOTOR_COMMAND_ACTION_RUN_FOR_DURATION: u8 = 1;
+const MOTOR_COMMAND_PAYLOAD_MAGIC_OFFSET: usize = 0;
+const MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET: usize = 4;
+const MOTOR_COMMAND_PAYLOAD_ACTION_OFFSET: usize = 5;
+const MOTOR_COMMAND_PAYLOAD_COMMAND_ID_OFFSET: usize = 6;
+const MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN: usize = 16;
+const MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET: usize = 22;
+const MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET: usize = 26;
+const MOTOR_COMMAND_PAYLOAD_LEN: usize = 30;
+const MOTOR_COMMAND_MAX_DURATION_MS: u32 = 5_000;
+const MOTOR_COMMAND_DEFAULT_EXPIRY_MS: u32 = 30_000;
+const MOTOR_COMMAND_DUPLICATE_RETENTION_MS: u32 = MOTOR_COMMAND_DEFAULT_EXPIRY_MS;
+const MOTOR_COMMAND_ACCEPTED_HISTORY_LEN: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorCommandAction {
+    Stop,
+    RunForDuration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MotorCommandPayload {
+    action: MotorCommandAction,
+    command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    duration_ms: u32,
+    expires_after_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorCommandValidationError {
+    InvalidLength,
+    InvalidMagic,
+    UnsupportedVersion,
+    UnknownAction,
+    DurationTooLong,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorCommandWriteOutcome {
+    Accepted(MotorCommandPayload),
+    Duplicate,
+    DuplicateActive,
+    Invalid(MotorCommandValidationError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedMotorCommandEntry {
+    command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    accepted_at_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMotorCommandRequest {
+    payload: MotorCommandPayload,
+    accepted_at_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MotorCommandState {
+    pending_request: Option<PendingMotorCommandRequest>,
+    accepted_history: [Option<AcceptedMotorCommandEntry>; MOTOR_COMMAND_ACCEPTED_HISTORY_LEN],
+}
+
+impl MotorCommandState {
+    const fn new() -> Self {
+        Self {
+            pending_request: None,
+            accepted_history: [None; MOTOR_COMMAND_ACCEPTED_HISTORY_LEN],
+        }
+    }
+
+    fn handle_write_payload(
+        &mut self,
+        payload: &[u8],
+        now_ms: u32,
+        active_command_id: Option<&[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN]>,
+    ) -> MotorCommandWriteOutcome {
+        let parsed = match parse_motor_command_payload(payload, now_ms) {
+            Ok(command) => command,
+            Err(err) => return MotorCommandWriteOutcome::Invalid(err),
+        };
+
+        if active_command_id
+            .map(|current| *current == parsed.command_id)
+            .unwrap_or(false)
+        {
+            return MotorCommandWriteOutcome::DuplicateActive;
+        }
+
+        if self
+            .pending_request
+            .as_ref()
+            .map(|pending| pending.payload.command_id == parsed.command_id)
+            .unwrap_or(false)
+        {
+            return MotorCommandWriteOutcome::DuplicateActive;
+        }
+
+        self.prune_expired_history(now_ms);
+        if self.is_duplicate(&parsed.command_id, now_ms) {
+            return MotorCommandWriteOutcome::Duplicate;
+        }
+
+        self.record_accepted(&parsed, now_ms);
+        MotorCommandWriteOutcome::Accepted(parsed)
+    }
+
+    fn prune_expired_history(&mut self, now_ms: u32) {
+        for slot in &mut self.accepted_history {
+            if let Some(entry) = slot {
+                let age_ms = now_ms.wrapping_sub(entry.accepted_at_ms);
+                if age_ms > MOTOR_COMMAND_DUPLICATE_RETENTION_MS {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    fn is_duplicate(
+        &self,
+        command_id: &[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+        now_ms: u32,
+    ) -> bool {
+        self.accepted_history.iter().any(|entry| {
+            entry
+                .as_ref()
+                .map(|accepted| {
+                    accepted.command_id == *command_id
+                        && now_ms.wrapping_sub(accepted.accepted_at_ms)
+                            <= MOTOR_COMMAND_DUPLICATE_RETENTION_MS
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn record_accepted(&mut self, payload: &MotorCommandPayload, now_ms: u32) {
+        self.pending_request = Some(PendingMotorCommandRequest {
+            payload: *payload,
+            accepted_at_ms: now_ms,
+        });
+
+        let entry = AcceptedMotorCommandEntry {
+            command_id: payload.command_id,
+            accepted_at_ms: now_ms,
+        };
+
+        if let Some(slot) = self.accepted_history.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+            return;
+        }
+
+        let oldest_index = self
+            .accepted_history
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, slot)| {
+                slot.map(|accepted| now_ms.wrapping_sub(accepted.accepted_at_ms))
+                    .unwrap_or(0)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.accepted_history[oldest_index] = Some(entry);
+    }
+}
+
+fn now_ms_u32() -> u32 {
+    Instant::now().as_millis() as u32
+}
+
+fn parse_motor_command_payload(
+    payload: &[u8],
+    _now_ms: u32,
+) -> Result<MotorCommandPayload, MotorCommandValidationError> {
+    if payload.len() != MOTOR_COMMAND_PAYLOAD_LEN {
+        return Err(MotorCommandValidationError::InvalidLength);
+    }
+
+    if &payload[MOTOR_COMMAND_PAYLOAD_MAGIC_OFFSET..MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET]
+        != MOTOR_COMMAND_PAYLOAD_MAGIC
+    {
+        return Err(MotorCommandValidationError::InvalidMagic);
+    }
+
+    if payload[MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET] != MOTOR_COMMAND_PAYLOAD_VERSION {
+        return Err(MotorCommandValidationError::UnsupportedVersion);
+    }
+
+    let action = match payload[MOTOR_COMMAND_PAYLOAD_ACTION_OFFSET] {
+        MOTOR_COMMAND_ACTION_STOP => MotorCommandAction::Stop,
+        MOTOR_COMMAND_ACTION_RUN_FOR_DURATION => MotorCommandAction::RunForDuration,
+        _ => return Err(MotorCommandValidationError::UnknownAction),
+    };
+
+    let mut command_id = [0u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN];
+    command_id.copy_from_slice(
+        &payload[MOTOR_COMMAND_PAYLOAD_COMMAND_ID_OFFSET..MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET],
+    );
+
+    let duration_ms = u32::from_le_bytes(
+        payload[MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET..MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET]
+            .try_into()
+            .expect("duration slice has fixed width"),
+    );
+    if duration_ms > MOTOR_COMMAND_MAX_DURATION_MS {
+        return Err(MotorCommandValidationError::DurationTooLong);
+    }
+
+    let expires_after_ms = u32::from_le_bytes(
+        payload[MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET..MOTOR_COMMAND_PAYLOAD_LEN]
+            .try_into()
+            .expect("expiry slice has fixed width"),
+    );
+    if expires_after_ms == 0 {
+        return Err(MotorCommandValidationError::Expired);
+    }
+
+    Ok(MotorCommandPayload {
+        action,
+        command_id,
+        duration_ms,
+        expires_after_ms,
+    })
+}
+
+// Motor command UART frame marker/prefix. This binary envelope is intentionally
+// distinct from human-readable debug UART log lines emitted through `log!`.
+// TODO(motor-uart-adapter): finalize full on-wire framing/checksum once motor
+// firmware protocol contract is provided.
+const MOTOR_UART_FRAME_MARKER: &[u8; 4] = b"HHMC";
+const MOTOR_UART_FRAME_VERSION: u8 = 1;
+const MOTOR_UART_FRAME_PREFIX_LEN: usize = 5;
+const MOTOR_UART_RESPONSE_TIMEOUT_MS: u64 = 150;
+const MOTOR_UART_ACTION_OFFSET: usize = MOTOR_UART_FRAME_PREFIX_LEN;
+const MOTOR_UART_COMMAND_ID_OFFSET: usize = MOTOR_UART_ACTION_OFFSET + 1;
+const MOTOR_UART_DURATION_OFFSET: usize =
+    MOTOR_UART_COMMAND_ID_OFFSET + MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN;
+const MOTOR_UART_FRAME_LEN: usize = MOTOR_UART_DURATION_OFFSET + 4;
+const MOTOR_UART_ACK_STATUS_OFFSET: usize = MOTOR_UART_FRAME_PREFIX_LEN;
+const MOTOR_UART_ACK_MIN_LEN: usize = MOTOR_UART_FRAME_PREFIX_LEN + 1;
+const MOTOR_UART_ACK_STATUS_SUCCESS: u8 = 0;
+
+type SharedLpuart1 = Uart<'static, embassy_stm32::mode::Async>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorUartResult {
+    Success,
+    Rejected { status: u8 },
+    InvalidResponse,
+    Timeout,
+    UartError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorDispatchOutcome {
+    RunStarted {
+        command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+        duration_ms: u32,
+    },
+    Stopped {
+        command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    },
+    Failed {
+        command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+        action: MotorCommandAction,
+        result: MotorUartResult,
+    },
+    ExpiredBeforeDispatch {
+        command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MotorTimeoutFailsafeAction {
+    SendBestEffortStop,
+    NoImmediateStop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MotorUartSimulationMatrix {
+    valid_ack: MotorUartResult,
+    rejected_ack: MotorUartResult,
+    invalid_ack: MotorUartResult,
+    timeout_failsafe: MotorTimeoutFailsafeAction,
+    marker_distinct_from_zts3000_request: bool,
+}
+
+struct MotorUartAdapter;
+
+impl MotorUartAdapter {
+    // NOTE: Motor UART currently shares the same physical LPUART1 peripheral used
+    // for soil RS485 wiring (PA2/PA3/PB1) on this hardware revision. Isolation is
+    // enforced logically by dedicated motor frame encode/parse helpers, never by
+    // reusing soil Modbus request/parse paths.
+    async fn run_motor_for_duration(
+        uart: &mut SharedLpuart1,
+        command_id: &[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+        duration_ms: u32,
+    ) -> MotorUartResult {
+        let clamped_duration_ms = duration_ms.min(MOTOR_COMMAND_MAX_DURATION_MS);
+        Self::send_command(
+            uart,
+            MOTOR_COMMAND_ACTION_RUN_FOR_DURATION,
+            command_id,
+            clamped_duration_ms,
+        )
+        .await
+    }
+
+    async fn stop_motor(
+        uart: &mut SharedLpuart1,
+        command_id: &[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    ) -> MotorUartResult {
+        Self::send_command(uart, MOTOR_COMMAND_ACTION_STOP, command_id, 0).await
+    }
+
+    async fn send_command(
+        uart: &mut SharedLpuart1,
+        action: u8,
+        command_id: &[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+        duration_ms: u32,
+    ) -> MotorUartResult {
+        log!(
+            "[motor] UART command write start command_id={:?} action={} duration_ms={} frame_marker={:?}",
+            command_id,
+            action,
+            duration_ms,
+            MOTOR_UART_FRAME_MARKER,
+        );
+        let frame = encode_motor_uart_frame(action, command_id, duration_ms);
+
+        if uart.write(&frame).await.is_err() {
+            log!(
+                "[motor] UART command write failed command_id={:?} action={} reason_code=UART_TIMEOUT stage=write",
+                command_id,
+                action,
+            );
+            return MotorUartResult::UartError;
+        }
+        if uart.flush().await.is_err() {
+            log!(
+                "[motor] UART command flush failed command_id={:?} action={} reason_code=UART_TIMEOUT stage=flush",
+                command_id,
+                action,
+            );
+            return MotorUartResult::UartError;
+        }
+
+        let mut ack = [0u8; 32];
+        let ack_len = match with_timeout(
+            Duration::from_millis(MOTOR_UART_RESPONSE_TIMEOUT_MS),
+            uart.read_until_idle(&mut ack),
+        )
+        .await
+        {
+            Ok(Ok(len)) => len,
+            Ok(Err(_)) => {
+                log!(
+                    "[motor] UART ack read failed command_id={:?} action={} reason_code=UART_TIMEOUT stage=read",
+                    command_id,
+                    action,
+                );
+                return MotorUartResult::UartError;
+            }
+            Err(_) => {
+                log!(
+                    "[motor] UART ack timeout command_id={:?} action={} reason_code=UART_TIMEOUT timeout_ms={}",
+                    command_id,
+                    action,
+                    MOTOR_UART_RESPONSE_TIMEOUT_MS,
+                );
+                return MotorUartResult::Timeout;
+            }
+        };
+
+        let parsed = parse_motor_uart_ack(&ack[..ack_len]);
+        log!(
+            "[motor] UART ack parsed command_id={:?} action={} result={:?} reason_code={}",
+            command_id,
+            action,
+            parsed,
+            motor_reason_code_for_uart_result(parsed),
+        );
+        parsed
+    }
+}
+
+struct MotorWatchdogState {
+    active: Option<MotorActiveCommand>,
+}
+
+#[derive(Clone, Copy)]
+struct MotorActiveCommand {
+    command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    deadline: Instant,
+}
+
+impl MotorWatchdogState {
+    const fn new() -> Self {
+        Self { active: None }
+    }
+
+    fn arm(&mut self, command_id: [u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN], duration_ms: u32) {
+        let clamped_duration_ms = duration_ms.min(MOTOR_COMMAND_MAX_DURATION_MS);
+        self.active = Some(MotorActiveCommand {
+            command_id,
+            deadline: Instant::now() + Duration::from_millis(clamped_duration_ms as u64),
+        });
+    }
+
+    fn disarm(&mut self) {
+        self.active = None;
+    }
+
+    fn active_command_id(&self) -> Option<&[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN]> {
+        self.active.as_ref().map(|active| &active.command_id)
+    }
+
+    async fn enforce_elapsed(&mut self, motor_uart: &mut SharedLpuart1) -> Option<MotorUartResult> {
+        let Some(active) = self.active else {
+            return None;
+        };
+
+        if Instant::now() < active.deadline {
+            return None;
+        }
+
+        let stop_result = MotorUartAdapter::stop_motor(motor_uart, &active.command_id).await;
+        self.disarm();
+        Some(stop_result)
+    }
+}
+
+fn encode_motor_uart_frame(
+    action: u8,
+    command_id: &[u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    duration_ms: u32,
+) -> [u8; MOTOR_UART_FRAME_LEN] {
+    let mut frame = [0u8; MOTOR_UART_FRAME_LEN];
+    frame[..MOTOR_UART_FRAME_MARKER.len()].copy_from_slice(MOTOR_UART_FRAME_MARKER);
+    frame[MOTOR_UART_FRAME_MARKER.len()] = MOTOR_UART_FRAME_VERSION;
+    frame[MOTOR_UART_ACTION_OFFSET] = action;
+    frame[MOTOR_UART_COMMAND_ID_OFFSET..MOTOR_UART_DURATION_OFFSET].copy_from_slice(command_id);
+    frame[MOTOR_UART_DURATION_OFFSET..MOTOR_UART_FRAME_LEN]
+        .copy_from_slice(&duration_ms.to_le_bytes());
+    frame
+}
+
+fn parse_motor_uart_ack(ack: &[u8]) -> MotorUartResult {
+    if ack.len() < MOTOR_UART_ACK_MIN_LEN {
+        return MotorUartResult::InvalidResponse;
+    }
+
+    if !ack.starts_with(MOTOR_UART_FRAME_MARKER) {
+        return MotorUartResult::InvalidResponse;
+    }
+
+    if ack[MOTOR_UART_FRAME_MARKER.len()] != MOTOR_UART_FRAME_VERSION {
+        return MotorUartResult::InvalidResponse;
+    }
+
+    let status = ack[MOTOR_UART_ACK_STATUS_OFFSET];
+    if status == MOTOR_UART_ACK_STATUS_SUCCESS {
+        MotorUartResult::Success
+    } else {
+        MotorUartResult::Rejected { status }
+    }
+}
+
+async fn dispatch_pending_motor_command(
+    motor_command_state: &mut MotorCommandState,
+    motor_watchdog: &mut MotorWatchdogState,
+    motor_uart: &mut SharedLpuart1,
+) -> Option<MotorDispatchOutcome> {
+    let pending = motor_command_state.pending_request.take()?;
+    let age_ms = now_ms_u32().wrapping_sub(pending.accepted_at_ms);
+    if age_ms >= pending.payload.expires_after_ms {
+        log!(
+            "[motor] pending command expired before UART dispatch command_id={:?} reason_code=EXPIRED age_ms={} expires_after_ms={}",
+            pending.payload.command_id,
+            age_ms,
+            pending.payload.expires_after_ms,
+        );
+        return Some(MotorDispatchOutcome::ExpiredBeforeDispatch {
+            command_id: pending.payload.command_id,
+        });
+    }
+
+    match pending.payload.action {
+        MotorCommandAction::Stop => {
+            let result =
+                MotorUartAdapter::stop_motor(motor_uart, &pending.payload.command_id).await;
+            if result == MotorUartResult::Success {
+                motor_watchdog.disarm();
+                Some(MotorDispatchOutcome::Stopped {
+                    command_id: pending.payload.command_id,
+                })
+            } else {
+                Some(MotorDispatchOutcome::Failed {
+                    command_id: pending.payload.command_id,
+                    action: pending.payload.action,
+                    result,
+                })
+            }
+        }
+        MotorCommandAction::RunForDuration => {
+            let clamped_duration_ms = pending
+                .payload
+                .duration_ms
+                .min(MOTOR_COMMAND_MAX_DURATION_MS);
+            let result = MotorUartAdapter::run_motor_for_duration(
+                motor_uart,
+                &pending.payload.command_id,
+                clamped_duration_ms,
+            )
+            .await;
+
+            if result == MotorUartResult::Success {
+                motor_watchdog.arm(pending.payload.command_id, clamped_duration_ms);
+                Some(MotorDispatchOutcome::RunStarted {
+                    command_id: pending.payload.command_id,
+                    duration_ms: clamped_duration_ms,
+                })
+            } else {
+                if timeout_failsafe_action_for_result(result)
+                    == MotorTimeoutFailsafeAction::SendBestEffortStop
+                {
+                    let _ =
+                        MotorUartAdapter::stop_motor(motor_uart, &pending.payload.command_id).await;
+                    motor_watchdog.disarm();
+                }
+                Some(MotorDispatchOutcome::Failed {
+                    command_id: pending.payload.command_id,
+                    action: pending.payload.action,
+                    result,
+                })
+            }
+        }
+    }
+}
+
+async fn idle_with_motor_watchdog(
+    duration_ms: u64,
+    motor_watchdog: &mut MotorWatchdogState,
+    motor_uart: &mut SharedLpuart1,
+) {
+    let deadline = Instant::now() + Duration::from_millis(duration_ms);
+
+    loop {
+        if let Some(stop_result) = motor_watchdog.enforce_elapsed(motor_uart).await {
+            log!(
+                "[motor] watchdog stop enforced during idle result={:?} reason_code={} watchdog_event=elapsed_duration",
+                stop_result,
+                motor_reason_code_for_uart_result(stop_result),
+            );
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+
+        let remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+        let sleep_chunk_ms = remaining_ms.min(100);
+        Timer::after_millis(sleep_chunk_ms).await;
+    }
+}
+
+fn timeout_failsafe_action_for_result(result: MotorUartResult) -> MotorTimeoutFailsafeAction {
+    if result == MotorUartResult::Timeout {
+        MotorTimeoutFailsafeAction::SendBestEffortStop
+    } else {
+        MotorTimeoutFailsafeAction::NoImmediateStop
+    }
+}
+
+fn motor_reason_code_for_uart_result(result: MotorUartResult) -> &'static str {
+    match result {
+        MotorUartResult::Success => "NONE",
+        MotorUartResult::Timeout | MotorUartResult::UartError => "UART_TIMEOUT",
+        MotorUartResult::Rejected { .. } | MotorUartResult::InvalidResponse => "UART_REJECTED",
+    }
+}
+
+fn simulate_motor_uart_ack_and_failsafe_matrix() -> MotorUartSimulationMatrix {
+    let mut valid_ack = [0u8; MOTOR_UART_ACK_MIN_LEN];
+    valid_ack[..MOTOR_UART_FRAME_MARKER.len()].copy_from_slice(MOTOR_UART_FRAME_MARKER);
+    valid_ack[MOTOR_UART_FRAME_MARKER.len()] = MOTOR_UART_FRAME_VERSION;
+    valid_ack[MOTOR_UART_ACK_STATUS_OFFSET] = MOTOR_UART_ACK_STATUS_SUCCESS;
+
+    let mut rejected_ack = valid_ack;
+    rejected_ack[MOTOR_UART_ACK_STATUS_OFFSET] = 7;
+
+    let invalid_ack = [0x00, 0x11, 0x22, 0x33, MOTOR_UART_FRAME_VERSION, 0x00];
+
+    let marker_distinct_from_zts3000_request =
+        MOTOR_UART_FRAME_MARKER != &ZTS3000_READ_HUM_TEMP[..MOTOR_UART_FRAME_MARKER.len()];
+
+    MotorUartSimulationMatrix {
+        valid_ack: parse_motor_uart_ack(&valid_ack),
+        rejected_ack: parse_motor_uart_ack(&rejected_ack),
+        invalid_ack: parse_motor_uart_ack(&invalid_ack),
+        timeout_failsafe: timeout_failsafe_action_for_result(MotorUartResult::Timeout),
+        marker_distinct_from_zts3000_request,
+    }
+}
+
+fn motor_uart_simulation_matrix_is_expected(matrix: MotorUartSimulationMatrix) -> bool {
+    matrix.valid_ack == MotorUartResult::Success
+        && matrix.rejected_ack == MotorUartResult::Rejected { status: 7 }
+        && matrix.invalid_ack == MotorUartResult::InvalidResponse
+        && matrix.timeout_failsafe == MotorTimeoutFailsafeAction::SendBestEffortStop
+        && matrix.marker_distinct_from_zts3000_request
+}
+
+fn simulate_motor_command_duplicate_and_expiry_rules() -> bool {
+    let now_ms = 10_000u32;
+    let expires_after_ms = 2_000u32;
+    let duration_ms = 1_000u32;
+    let command_id = [0xAB; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN];
+
+    let payload = MotorCommandPayload {
+        action: MotorCommandAction::RunForDuration,
+        command_id,
+        duration_ms,
+        expires_after_ms,
+    };
+
+    let mut encoded = [0u8; MOTOR_COMMAND_PAYLOAD_LEN];
+    encoded[MOTOR_COMMAND_PAYLOAD_MAGIC_OFFSET..MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET]
+        .copy_from_slice(MOTOR_COMMAND_PAYLOAD_MAGIC);
+    encoded[MOTOR_COMMAND_PAYLOAD_VERSION_OFFSET] = MOTOR_COMMAND_PAYLOAD_VERSION;
+    encoded[MOTOR_COMMAND_PAYLOAD_ACTION_OFFSET] = MOTOR_COMMAND_ACTION_RUN_FOR_DURATION;
+    encoded[MOTOR_COMMAND_PAYLOAD_COMMAND_ID_OFFSET..MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET]
+        .copy_from_slice(&payload.command_id);
+    encoded[MOTOR_COMMAND_PAYLOAD_DURATION_MS_OFFSET..MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET]
+        .copy_from_slice(&payload.duration_ms.to_le_bytes());
+    encoded[MOTOR_COMMAND_PAYLOAD_EXPIRY_MS_OFFSET..MOTOR_COMMAND_PAYLOAD_LEN]
+        .copy_from_slice(&payload.expires_after_ms.to_le_bytes());
+
+    let mut state = MotorCommandState::new();
+    let first = state.handle_write_payload(&encoded, now_ms, None);
+    let duplicate_pending = state.handle_write_payload(&encoded, now_ms + 1, None);
+    let duplicate_active = state.handle_write_payload(&encoded, now_ms + 2, Some(&command_id));
+
+    let pending = PendingMotorCommandRequest {
+        payload,
+        accepted_at_ms: now_ms,
+    };
+    let age_ms = (now_ms + expires_after_ms + 1).wrapping_sub(pending.accepted_at_ms);
+    let expired_before_dispatch = age_ms >= pending.payload.expires_after_ms;
+
+    first == MotorCommandWriteOutcome::Accepted(payload)
+        && duplicate_pending == MotorCommandWriteOutcome::DuplicateActive
+        && duplicate_active == MotorCommandWriteOutcome::DuplicateActive
+        && expired_before_dispatch
+}
 
 const BLE_CFG_IRK: [u8; 16] = [
     0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
@@ -330,7 +1006,7 @@ async fn main(spawner: Spawner) {
     ble.add_service(&AddServiceParameters {
         uuid: Uuid::Uuid16(ENVIRONMENTAL_SENSING_SERVICE_UUID),
         service_type: ServiceType::Primary,
-        max_attribute_records: 20,
+        max_attribute_records: 24,
     })
     .await;
     let env_service_handle = match wait_for_gatt_add_service_complete(&mut ble).await {
@@ -506,6 +1182,30 @@ async fn main(spawner: Spawner) {
         }
     };
 
+    log!("[ble ] add motor command characteristic (custom 128-bit)");
+    ble.add_characteristic(&AddCharacteristicParameters {
+        service_handle: env_service_handle,
+        characteristic_uuid: Uuid::Uuid128(MOTOR_COMMAND_CHAR_UUID),
+        characteristic_properties: CharacteristicProperty::WRITE,
+        characteristic_value_len: MOTOR_COMMAND_PAYLOAD_LEN as u16,
+        security_permissions: CharacteristicPermission::empty(),
+        gatt_event_mask: CharacteristicEvent::CONFIRM_WRITE,
+        encryption_key_size: EncryptionKeySize::with_value(7).unwrap(),
+        is_variable: false,
+    })
+    .await;
+    let motor_command_char_handle = match wait_for_gatt_add_characteristic_complete(&mut ble).await
+    {
+        Some(handle) => {
+            log!("[ble ] motor_command char handle: {:?}", handle);
+            handle
+        }
+        None => {
+            log!("[ble ] failed to add motor command characteristic");
+            return;
+        }
+    };
+
     let gatt_handles = GattHandles {
         probe_uuid: probe_uuid_char_handle,
         air_temp: air_temp_char_handle,
@@ -514,7 +1214,10 @@ async fn main(spawner: Spawner) {
         soil_temp: soil_temp_char_handle,
         soil_humidity: soil_hum_char_handle,
         setup_confirm: setup_confirm_char_handle,
+        motor_command: motor_command_char_handle,
     };
+
+    let mut motor_command_state = MotorCommandState::new();
 
     let mut i2c_resources = I2cSensorPeripherals {
         i2c1: p.I2C1,
@@ -532,7 +1235,12 @@ async fn main(spawner: Spawner) {
     rs485_config.baudrate = 4_800;
     rs485_config.de_assertion_time = 1;
     rs485_config.de_deassertion_time = 1;
-    let mut rs485 = match Uart::new_with_de(
+    // Physical wiring constraint: there is a single LPUART1 (PA2/PA3/PB1) used
+    // for RS485 transceiver access. This handle is shared by:
+    // - soil ZTS3000 Modbus requests/responses (`read_zts3000` parser path)
+    // - motor UART adapter frames (`encode_motor_uart_frame`/`parse_motor_uart_ack` path)
+    // The protocols remain logically isolated and frame formats are distinct.
+    let mut shared_lpuart1 = match Uart::new_with_de(
         p.LPUART1,
         p.PA3,
         p.PA2,
@@ -550,6 +1258,26 @@ async fn main(spawner: Spawner) {
     };
 
     let mut snapshot = SensorSnapshot::default();
+    let mut motor_watchdog = MotorWatchdogState::new();
+    let motor_simulation = simulate_motor_uart_ack_and_failsafe_matrix();
+    log!(
+        "[motor] simulation valid_ack={:?} rejected_ack={:?} invalid_ack={:?} timeout_failsafe={:?} marker_distinct={}",
+        motor_simulation.valid_ack,
+        motor_simulation.rejected_ack,
+        motor_simulation.invalid_ack,
+        motor_simulation.timeout_failsafe,
+        motor_simulation.marker_distinct_from_zts3000_request,
+    );
+    if !motor_uart_simulation_matrix_is_expected(motor_simulation) {
+        log!("[motor] simulation matrix mismatch; refusing to start main lifecycle");
+        return;
+    }
+
+    if !simulate_motor_command_duplicate_and_expiry_rules() {
+        log!("[motor] duplicate/expiry simulation mismatch; refusing to start main lifecycle");
+        return;
+    }
+
     if !update_ble_environmental_values(&mut ble, env_service_handle, &gatt_handles, &snapshot)
         .await
     {
@@ -592,10 +1320,10 @@ async fn main(spawner: Spawner) {
             "[cycle] sleep/idle for {}s before measurement",
             SLEEP_DURATION_MS / 1000
         );
-        Timer::after_millis(SLEEP_DURATION_MS).await;
+        idle_with_motor_watchdog(SLEEP_DURATION_MS, &mut motor_watchdog, &mut shared_lpuart1).await;
 
         let bme_reading = run_bme280_phase(&mut i2c_resources, &mut i2c_power).await;
-        let soil_reading = run_zts3000_phase(&mut rs485, &mut rs485_power).await;
+        let soil_reading = run_zts3000_phase(&mut shared_lpuart1, &mut rs485_power).await;
         snapshot = SensorSnapshot::from_phase_results(bme_reading, soil_reading);
 
         if !update_ble_environmental_values(&mut ble, env_service_handle, &gatt_handles, &snapshot)
@@ -625,7 +1353,14 @@ async fn main(spawner: Spawner) {
             continue;
         }
 
-        run_advertising_session(&mut ble).await;
+        run_advertising_session(
+            &mut ble,
+            &gatt_handles,
+            &mut motor_command_state,
+            &mut motor_watchdog,
+            &mut shared_lpuart1,
+        )
+        .await;
     }
 }
 
@@ -763,12 +1498,19 @@ async fn run_setup_advertising_session(
                 }
                 Event::Vendor(VendorEvent::AttWritePermitRequest(request)) => {
                     let setup_confirm_value_handle = gatt_handles.setup_confirm_value_handle();
-                    let accepted = request.attribute_handle == setup_confirm_value_handle
-                        && request.value() == SETUP_COMPLETE_MAGIC;
-
-                    if accepted {
+                    let motor_command_value_handle = gatt_handles.motor_command_value_handle();
+                    let status = if request.attribute_handle == setup_confirm_value_handle
+                        && request.value() == SETUP_COMPLETE_MAGIC
+                    {
                         setup_confirmed = true;
                         log!("[setup] hub pickup confirmation received");
+                        Ok(())
+                    } else if request.attribute_handle == motor_command_value_handle {
+                        log!(
+                            "[motor] motor command rejected during setup mode attr={:?}",
+                            request.attribute_handle
+                        );
+                        Err(Status::InvalidParameters)
                     } else {
                         log!(
                             "[setup] rejected write attr={:?} expected_attr={:?} value={:?}",
@@ -776,13 +1518,14 @@ async fn run_setup_advertising_session(
                             setup_confirm_value_handle,
                             request.value()
                         );
-                    }
+                        Err(Status::InvalidParameters)
+                    };
 
                     if ble
                         .write_response(&embassy_stm32_wpan::hci::vendor::command::gatt::WriteResponseParameters {
                             conn_handle: request.conn_handle,
                             attribute_handle: request.attribute_handle,
-                            status: if accepted { Ok(()) } else { Err(Status::InvalidParameters) },
+                            status,
                             value: request.value(),
                         })
                         .await
@@ -937,12 +1680,18 @@ struct GattHandles {
     soil_temp: AttributeHandle,
     soil_humidity: AttributeHandle,
     setup_confirm: AttributeHandle,
+    motor_command: AttributeHandle,
 }
 
 impl GattHandles {
     fn setup_confirm_value_handle(&self) -> AttributeHandle {
         // ST returns the characteristic declaration handle; central writes target the value handle.
         AttributeHandle(self.setup_confirm.0 + 1)
+    }
+
+    fn motor_command_value_handle(&self) -> AttributeHandle {
+        // ST returns the characteristic declaration handle; central writes target the value handle.
+        AttributeHandle(self.motor_command.0 + 1)
     }
 }
 
@@ -1184,7 +1933,13 @@ async fn wait_for_gap_set_nondiscoverable_complete(ble: &mut impl UartHci) -> bo
     }
 }
 
-async fn run_advertising_session(ble: &mut (impl UartHci + GapCommands)) {
+async fn run_advertising_session(
+    ble: &mut (impl UartHci + GapCommands + GattCommands),
+    gatt_handles: &GattHandles,
+    motor_command_state: &mut MotorCommandState,
+    motor_watchdog: &mut MotorWatchdogState,
+    motor_uart: &mut SharedLpuart1,
+) {
     log!(
         "[ble ] advertising for up to {}s waiting for central",
         BLE_ADV_TIMEOUT_MS / 1000
@@ -1197,6 +1952,47 @@ async fn run_advertising_session(ble: &mut (impl UartHci + GapCommands)) {
 
     loop {
         let now = Instant::now();
+
+        if let Some(dispatch_outcome) =
+            dispatch_pending_motor_command(motor_command_state, motor_watchdog, motor_uart).await
+        {
+            match dispatch_outcome {
+                MotorDispatchOutcome::RunStarted {
+                    command_id,
+                    duration_ms,
+                } => log!(
+                    "[motor] UART run command sent command_id={:?} duration_ms={} reason_code=NONE validation=accepted (clamped/local-safe)",
+                    command_id,
+                    duration_ms
+                ),
+                MotorDispatchOutcome::Stopped { command_id } => {
+                    log!("[motor] UART stop command sent command_id={:?} reason_code=NONE", command_id)
+                }
+                MotorDispatchOutcome::Failed {
+                    command_id,
+                    action,
+                    result,
+                } => log!(
+                    "[motor] UART dispatch failed command_id={:?} action={:?} result={:?} reason_code={}",
+                    command_id,
+                    action,
+                    result,
+                    motor_reason_code_for_uart_result(result),
+                ),
+                MotorDispatchOutcome::ExpiredBeforeDispatch { command_id } => log!(
+                    "[motor] pending command expired before UART dispatch command_id={:?} reason_code=EXPIRED",
+                    command_id
+                ),
+            }
+        }
+
+        if let Some(stop_result) = motor_watchdog.enforce_elapsed(motor_uart).await {
+            log!(
+                "[motor] watchdog stop enforced after elapsed duration result={:?} reason_code={} watchdog_event=elapsed_duration",
+                stop_result,
+                motor_reason_code_for_uart_result(stop_result),
+            );
+        }
 
         if active_conn_handle.is_none() && now >= adv_deadline {
             log!("[ble ] advertise timeout reached; stop discoverable");
@@ -1250,6 +2046,60 @@ async fn run_advertising_session(ble: &mut (impl UartHci + GapCommands)) {
                         disconnection.reason
                     );
                     return;
+                }
+                Event::Vendor(VendorEvent::AttWritePermitRequest(request)) => {
+                    let motor_command_value_handle = gatt_handles.motor_command_value_handle();
+                    let status = if request.attribute_handle == motor_command_value_handle {
+                        match motor_command_state.handle_write_payload(
+                            request.value(),
+                            now_ms_u32(),
+                            motor_watchdog.active_command_id(),
+                        ) {
+                            MotorCommandWriteOutcome::Accepted(command) => {
+                                log!(
+                                    "[motor] accepted command command_id={:?} action={:?} duration_ms={} expires_after_ms={} reason_code=NONE validation=accepted (dispatch to UART adapter pending loop scheduling)",
+                                    command.command_id,
+                                    command.action,
+                                    command.duration_ms,
+                                    command.expires_after_ms
+                                );
+                                Ok(())
+                            }
+                            MotorCommandWriteOutcome::Duplicate => {
+                                log!("[motor] duplicate command ignored reason_code=DUPLICATE");
+                                Err(Status::InvalidParameters)
+                            }
+                            MotorCommandWriteOutcome::DuplicateActive => {
+                                log!("[motor] duplicate active command rejected reason_code=DUPLICATE");
+                                Err(Status::InvalidParameters)
+                            }
+                            MotorCommandWriteOutcome::Invalid(err) => {
+                                log!("[motor] invalid command rejected: {:?} reason_code=UART_REJECTED", err);
+                                Err(Status::InvalidParameters)
+                            }
+                        }
+                    } else {
+                        log!(
+                            "[ble ] rejected non-motor write attr={:?} expected_attr={:?}",
+                            request.attribute_handle,
+                            motor_command_value_handle
+                        );
+                        Err(Status::InvalidParameters)
+                    };
+
+                    if ble
+                        .write_response(&embassy_stm32_wpan::hci::vendor::command::gatt::WriteResponseParameters {
+                            conn_handle: request.conn_handle,
+                            attribute_handle: request.attribute_handle,
+                            status,
+                            value: request.value(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        log!("[ble ] write response command failed");
+                        return;
+                    }
                 }
                 _ => {}
             },
@@ -1419,7 +2269,7 @@ fn log_bme280_average(address: u8, reading: bme280::Reading, samples: u32) {
 }
 
 async fn run_zts3000_phase(
-    rs485: &mut Uart<'static, embassy_stm32::mode::Async>,
+    rs485: &mut SharedLpuart1,
     power: &mut Output<'static>,
 ) -> Option<Zts3000Reading> {
     power.set_low();
@@ -1456,9 +2306,7 @@ async fn run_zts3000_phase(
     result
 }
 
-async fn read_zts3000(
-    rs485: &mut Uart<'static, embassy_stm32::mode::Async>,
-) -> Result<Zts3000Reading, Zts3000ReadError> {
+async fn read_zts3000(rs485: &mut SharedLpuart1) -> Result<Zts3000Reading, Zts3000ReadError> {
     rs485
         .write(&ZTS3000_READ_HUM_TEMP)
         .await
