@@ -1355,6 +1355,7 @@ async fn main(spawner: Spawner) {
 
         run_advertising_session(
             &mut ble,
+            &discovery_params,
             &gatt_handles,
             &mut motor_command_state,
             &mut motor_watchdog,
@@ -1935,6 +1936,7 @@ async fn wait_for_gap_set_nondiscoverable_complete(ble: &mut impl UartHci) -> bo
 
 async fn run_advertising_session(
     ble: &mut (impl UartHci + GapCommands + GattCommands),
+    discovery_params: &DiscoverableParameters<'_, '_>,
     gatt_handles: &GattHandles,
     motor_command_state: &mut MotorCommandState,
     motor_watchdog: &mut MotorWatchdogState,
@@ -2041,11 +2043,29 @@ async fn run_advertising_session(
                 Event::LeConnectionComplete(_) => {}
                 Event::DisconnectionComplete(disconnection) => {
                     log!(
-                        "[ble ] disconnected handle={:?} reason={:?}; end advertising session",
+                        "[ble ] disconnected handle={:?} reason={:?}; resume advertising session",
                         disconnection.conn_handle,
                         disconnection.reason
                     );
-                    return;
+                    active_conn_handle = None;
+                    conn_deadline = None;
+                    if ble.set_discoverable(&discovery_params).await.is_err() {
+                        log!("[ble ] rediscoverable command failed");
+                        return;
+                    }
+                    if !wait_for_gap_set_discoverable_complete(ble).await {
+                        log!("[ble ] rediscoverable command-complete indicated failure");
+                        return;
+                    }
+                    log!("[ble ] refresh normal advertising data");
+                    if ble.update_advertising_data(&PROBE_ADV_DATA).await.is_err() {
+                        log!("[ble ] normal advertising data refresh command failed");
+                        return;
+                    }
+                    if !wait_for_gap_update_advertising_data_complete(ble).await {
+                        log!("[ble ] normal advertising data refresh indicated failure");
+                        return;
+                    }
                 }
                 Event::Vendor(VendorEvent::AttWritePermitRequest(request)) => {
                     let motor_command_value_handle = gatt_handles.motor_command_value_handle();
