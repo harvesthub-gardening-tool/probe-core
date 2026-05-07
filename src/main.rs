@@ -1518,6 +1518,7 @@ async fn main(spawner: Spawner) {
 
         run_advertising_session(
             &mut ble,
+            env_service_handle,
             &discovery_params,
             &gatt_handles,
             &mut motor_command_state,
@@ -2030,12 +2031,20 @@ async fn update_ble_environmental_values(
         return false;
     }
 
-    let motor_result_payload =
-        build_motor_result_payload(last_motor_result.unwrap_or(MotorResultPayload {
-            status: motor_status_code(MotorCommandStatusWire::SentToProbe),
-            reason_code: motor_reason_code(MotorReasonCodeWire::None),
-            command_id: [0u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
-        }));
+    update_motor_result_characteristic(ble, service_handle, handles, last_motor_result).await
+}
+
+async fn update_motor_result_characteristic(
+    ble: &mut (impl UartHci + GattCommands),
+    service_handle: AttributeHandle,
+    handles: &GattHandles,
+    result: Option<MotorResultPayload>,
+) -> bool {
+    let motor_result_payload = build_motor_result_payload(result.unwrap_or(MotorResultPayload {
+        status: motor_status_code(MotorCommandStatusWire::SentToProbe),
+        reason_code: motor_reason_code(MotorReasonCodeWire::None),
+        command_id: [0u8; MOTOR_COMMAND_PAYLOAD_COMMAND_ID_LEN],
+    }));
 
     if ble
         .update_characteristic_value(&UpdateCharacteristicValueParameters {
@@ -2126,6 +2135,7 @@ async fn wait_for_gap_set_nondiscoverable_complete(ble: &mut impl UartHci) -> bo
 
 async fn run_advertising_session(
     ble: &mut (impl UartHci + GapCommands + GattCommands),
+    service_handle: AttributeHandle,
     discovery_params: &DiscoverableParameters<'_, '_>,
     gatt_handles: &GattHandles,
     motor_command_state: &mut MotorCommandState,
@@ -2150,6 +2160,17 @@ async fn run_advertising_session(
         {
             motor_command_state
                 .set_last_result(last_result_from_dispatch_outcome(dispatch_outcome));
+            if !update_motor_result_characteristic(
+                ble,
+                service_handle,
+                gatt_handles,
+                motor_command_state.last_result(),
+            )
+            .await
+            {
+                log!("[ble ] failed to refresh motor result after dispatch outcome");
+                return;
+            }
             match dispatch_outcome {
                 MotorDispatchOutcome::RunStarted {
                     command_id,
@@ -2182,6 +2203,17 @@ async fn run_advertising_session(
 
         if let Some(stop_outcome) = motor_watchdog.enforce_elapsed(motor_uart).await {
             motor_command_state.set_last_result(last_result_from_dispatch_outcome(stop_outcome));
+            if !update_motor_result_characteristic(
+                ble,
+                service_handle,
+                gatt_handles,
+                motor_command_state.last_result(),
+            )
+            .await
+            {
+                log!("[ble ] failed to refresh motor result after watchdog outcome");
+                return;
+            }
             log!(
                 "[motor] watchdog stop enforced after elapsed duration outcome={:?} watchdog_event=elapsed_duration",
                 stop_outcome,
@@ -2273,6 +2305,17 @@ async fn run_advertising_session(
                                     reason_code: motor_reason_code(MotorReasonCodeWire::None),
                                     command_id: command.command_id,
                                 });
+                                if !update_motor_result_characteristic(
+                                    ble,
+                                    service_handle,
+                                    gatt_handles,
+                                    motor_command_state.last_result(),
+                                )
+                                .await
+                                {
+                                    log!("[ble ] failed to refresh motor result after command accept");
+                                    return;
+                                }
                                 log!(
                                     "[motor] accepted command command_id={:?} action={:?} duration_ms={} expires_after_ms={} reason_code=NONE validation=accepted (dispatch to UART adapter pending loop scheduling)",
                                     command.command_id,
